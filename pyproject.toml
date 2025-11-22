@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qrtunnel"
-version = "1.1"
+version = "0.1"
 description = "Cross-platform file sharing via SSH reverse tunneling and QR codes"
 readme = "README.md"
 requires-python = ">=3.6"
