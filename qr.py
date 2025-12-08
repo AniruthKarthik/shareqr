@@ -22,37 +22,27 @@ from pathlib import Path
 
 
 def getch():
-    """Reads a single character from stdin without echoing or requiring Enter."""
-    
+    """Reads a single character from stdin without blocking or requiring Enter."""
     if platform.system() == 'Windows':
-        try:
-            import msvcrt
-            if msvcrt.kbhit():
-                return msvcrt.getch().decode('utf-8', errors='ignore')
-            return None
-        except:
-            return None
+        import msvcrt
+        if msvcrt.kbhit():
+            return msvcrt.getch().decode(errors='ignore')
+        return None
     else:
+        import sys
+        import termios
+        import tty
+        import select
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
         try:
-            import select
-            import sys
-            import tty
-            import termios
-            
-            # Check if there's input available (non-blocking)
-            rlist, _, _ = select.select([sys.stdin], [], [], 0)
-            if rlist:
-                fd = sys.stdin.fileno()
-                old_settings = termios.tcgetattr(fd)
-                try:
-                    tty.setraw(sys.stdin.fileno())
-                    ch = sys.stdin.read(1)
-                finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                return ch
-            return None
-        except:
-            return None
+            tty.setcbreak(fd)
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return None
 
 
 class Config:
@@ -62,23 +52,329 @@ class Config:
     CONFIG_FILE = CONFIG_DIR / "config.json"
     
 
-class FileShareHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for file sharing"""
+class FileTransferHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for file sharing and uploading"""
     
     file_paths = None
+    upload_mode = False
     
     def log_message(self, format, *args):
         """Suppress default logging"""
         pass
-    
+
     def do_GET(self):
         """Handle GET requests"""
-        parsed_path = urlparse(self.path)
-        
-        if parsed_path.path == '/download':
-            self.serve_files_as_zip()
+        if self.upload_mode:
+            self.send_upload_page()
         else:
-            self.send_download_page()
+            parsed_path = urlparse(self.path)
+            if parsed_path.path == '/download':
+                self.serve_files_as_zip()
+            else:
+                self.send_download_page()
+
+    def do_POST(self):
+        """Handle POST requests for file uploads"""
+        if self.upload_mode:
+            self.handle_upload()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def handle_upload(self):
+        """Handle file upload"""
+        content_type = self.headers['Content-Type']
+        if not content_type or not content_type.startswith('multipart/form-data'):
+            self.send_error(400, "Invalid form data")
+            return
+
+        boundary = content_type.split("=")[1].encode()
+        content_length = int(self.headers['Content-Length'])
+        body = self.rfile.read(content_length)
+        
+        parts = body.split(b'--' + boundary)
+        
+        for part in parts:
+            if b'Content-Disposition: form-data;' in part:
+                header, content = part.split(b'\r\n\r\n', 1)
+                
+                # Clean up content
+                content = content.rsplit(b'\r\n', 1)[0]
+                
+                # Extract filename
+                filename_match = re.search(b'filename="(.*?)"', header, re.DOTALL)
+                if filename_match:
+                    filename = filename_match.group(1).decode('utf-8', errors='ignore')
+                    
+                    # Sanitize filename to prevent directory traversal
+                    filename = os.path.basename(filename)
+                    if not filename:
+                        continue # Skip if filename is empty after sanitizing
+
+                    save_path = Path.cwd() / filename
+                    
+                    try:
+                        with open(save_path, 'wb') as f:
+                            f.write(content)
+                        
+                        print(f"✓ File '{filename}' received and saved to {save_path}")
+                        
+                        # Send styled success response
+                        self.send_response(200)
+                        self.send_header('Content-type', 'text/html')
+                        
+                        success_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>qrtunnel - Upload Success</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #eee;
+        }}
+        .container {{
+            background: #16213e;
+            border-radius: 8px;
+            padding: 40px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            max-width: 480px;
+            width: 100%;
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 32px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid #2a3a5e;
+        }}
+        h1 {{
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #fff;
+        }}
+        .subtitle {{
+            font-size: 14px;
+            color: #888;
+        }}
+        .success-message {{
+            text-align: center;
+            margin-bottom: 20px;
+            color: #4CAF50;
+            font-size: 1.2em;
+        }}
+        .link-button {{
+            display: block;
+            width: 100%;
+            padding: 16px 24px;
+            background: #4361ee;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            text-decoration: none;
+            text-align: center;
+            transition: background 0.2s ease;
+            margin-top: 20px;
+        }}
+        .link-button:hover {{
+            background: #3a56d4;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 24px;
+            font-size: 12px;
+            color: #555;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Upload Status</h1>
+        </div>
+        <div class="success-message">
+            <p>File '<strong>{filename}</strong>' uploaded successfully!</p>
+        </div>
+        <a href="/" class="link-button">Upload Another File</a>
+        <p class="footer">qrtunnel</p>
+    </div>
+</body>
+</html>"""
+                        
+                        self.send_header('Content-Length', len(success_html.encode()))
+                        self.end_headers()
+                        self.wfile.write(success_html.encode())
+                        return
+                    except Exception as e:
+                        print(f"✗ Error saving file '{filename}': {e}")
+                        self.send_error(500, "Error saving file")
+                        return
+
+        self.send_error(400, "File not found in form data")
+
+    def send_upload_page(self):
+        """Send HTML page for file uploading"""
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>qrtunnel - File Upload</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #eee;
+        }
+        .container {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 40px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            max-width: 480px;
+            width: 100%;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 32px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid #2a3a5e;
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #fff;
+        }
+        .subtitle {
+            font-size: 14px;
+            color: #888;
+        }
+        .upload-form {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .file-input-wrapper {
+            position: relative;
+            width: 100%;
+            padding: 16px 24px;
+            background: #0f0f1a;
+            border: 1px dashed #4361ee;
+            border-radius: 6px;
+            text-align: center;
+            cursor: pointer;
+            transition: background 0.2s ease, border-color 0.2s ease;
+        }
+        .file-input-wrapper:hover {
+            background: #1f1f2a;
+            border-color: #5a78ff;
+        }
+        #file-input {
+            opacity: 0;
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+        .file-input-label {
+            font-size: 14px;
+            font-weight: 500;
+            color: #ccc;
+        }
+        #file-name {
+            margin-top: 12px;
+            font-size: 12px;
+            font-family: 'SF Mono', 'Consolas', monospace;
+            color: #888;
+        }
+        .submit-button {
+            display: block;
+            width: 100%;
+            padding: 16px 24px;
+            background: #4361ee;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            text-align: center;
+            transition: background 0.2s ease;
+            opacity: 0.5;
+            pointer-events: none;
+        }
+        .submit-button.enabled {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .submit-button:hover.enabled {
+            background: #3a56d4;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 24px;
+            font-size: 12px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Upload File</h1>
+            <p class="subtitle">Select a file to send to this computer</p>
+        </div>
+        <form id="upload-form" class="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+            <div class="file-input-wrapper">
+                <label for="file-input" class="file-input-label">Click to select a file</label>
+                <input type="file" id="file-input" name="file" required>
+                <p id="file-name"></p>
+            </div>
+            <button type="submit" id="submit-btn" class="submit-button">Upload</button>
+        </form>
+        <p class="footer">qrtunnel</p>
+    </div>
+    <script>
+        const fileInput = document.getElementById('file-input');
+        const fileNameDisplay = document.getElementById('file-name');
+        const submitButton = document.getElementById('submit-btn');
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                fileNameDisplay.textContent = `Selected: ${fileInput.files[0].name}`;
+                submitButton.classList.add('enabled');
+            } else {
+                fileNameDisplay.textContent = '';
+                submitButton.classList.remove('enabled');
+            }
+        });
+    </script>
+</body>
+</html>"""
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.send_header('Content-Length', len(html.encode()))
+        self.end_headers()
+        self.wfile.write(html.encode())
+
     
     def send_download_page(self):
         """Send HTML page with a download button"""
@@ -652,13 +948,14 @@ def format_size(bytes):
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="qrtunnel: Simple cross-platform file sharing via QR code with ngrok.",
-        usage="qrtunnel <file_path1> [<file_path2> ...] [options]"
+        description="qrtunnel: Simple cross-platform file sharing and receiving via QR code.",
+        usage="""qrtunnel [file_path1] [file_path2] ... [options]
+       qrtunnel (starts in upload mode)"""
     )
-    parser.add_argument('file_paths', nargs='*', help='One or more paths to the files you want to share.')
+    parser.add_argument('file_paths', nargs='*', help='One or more paths to files to share. If no files are provided, starts in upload mode.')
     parser.add_argument('--setup', action='store_true', help='Set up or reconfigure ngrok authtoken')
     parser.add_argument('--status', action='store_true', help='Check authentication status')
-    parser.add_argument('--noauth', action='store_true', help='Use SSH tunnel (localhost.run) without authentication (Mac/Linux only)')
+    parser.add_argument('--noauth', action='store_true', help='Use SSH tunnel (localhost.run) without authentication (recommended for non-Windows)')
     
     args = parser.parse_args()
     
@@ -667,7 +964,7 @@ def main():
         auth = NgrokAuth()
         token = auth.setup_ngrok_account()
         if token:
-            print("\n✓ Setup complete! You can now use qrtunnel to share files.")
+            print("\n✓ Setup complete! You can now use qrtunnel to share or receive files.")
         else:
             print("\n✗ Setup incomplete. Please try again.")
         sys.exit(0 if token else 1)
@@ -690,6 +987,9 @@ def main():
             print("  2. Or visit: https://dashboard.ngrok.com/get-started/your-authtoken")
         print("="*60 + "\n")
         sys.exit(0 if token else 1)
+        
+    # Determine mode (upload or download)
+    upload_mode = not args.file_paths
     
     # Handle --noauth on Windows
     noauth_mode = args.noauth
@@ -703,44 +1003,51 @@ def main():
         print("="*60)
         noauth_mode = False
     
-    # Validate that we have files to share
-    if not args.file_paths:
-        parser.print_help()
-        sys.exit(1)
-    
-    file_paths = args.file_paths
-    
-    # Validate files
-    for file_path in file_paths:
-        if not os.path.exists(file_path):
-            print(f"✗ Error: File '{file_path}' not found")
-            sys.exit(1)
-        
-        if not os.path.isfile(file_path):
-            print(f"✗ Error: '{file_path}' is not a file")
-            sys.exit(1)
-    
+    # Validate files in download mode
+    if not upload_mode:
+        for file_path in args.file_paths:
+            if not os.path.exists(file_path):
+                print(f"✗ Error: File '{file_path}' not found")
+                sys.exit(1)
+            
+            if not os.path.isfile(file_path):
+                print(f"✗ Error: '{file_path}' is not a file")
+                sys.exit(1)
+
     # Display banner
     print("\n" + "="*60)
-    print("qrtunnel - Simple File Sharing")
+    print("qrtunnel - Simple File Transfer")
     print(f"Platform: {platform.system()} {platform.release()}")
-    if noauth_mode:
-        print("Mode: No-auth (SSH tunnel via localhost.run)")
+
+    if upload_mode:
+        print("Mode: Upload (receive files)")
     else:
-        print("Mode: ngrok (authenticated)")
-    print("="*60)
-    print("Files to be shared:")
-    for file_path in file_paths:
-        size = os.path.getsize(file_path)
-        print(f"  - {os.path.basename(file_path)} ({format_size(size)})")
+        print("Mode: Download (share files)")
+
+    if noauth_mode:
+        print("Tunnel: No-auth (SSH via localhost.run)")
+    else:
+        print("Tunnel: ngrok (authenticated)")
     print("="*60)
     
-    # Set up handler with file paths
-    FileShareHandler.file_paths = file_paths
+    if not upload_mode:
+        print("Files to be shared:")
+        for file_path in args.file_paths:
+            size = os.path.getsize(file_path)
+            print(f"  - {os.path.basename(file_path)} ({format_size(size)})")
+        print("="*60)
+    else:
+        print("Upload directory:")
+        print(f"  - {os.getcwd()}")
+        print("="*60)
+
+    # Set up handler
+    FileTransferHandler.file_paths = args.file_paths if not upload_mode else None
+    FileTransferHandler.upload_mode = upload_mode
     
     # Start HTTP server
     try:
-        server = HTTPServer(('localhost', Config.LOCAL_PORT), FileShareHandler)
+        server = HTTPServer(('localhost', Config.LOCAL_PORT), FileTransferHandler)
     except OSError as e:
         print(f"\n✗ Error: Could not bind to port {Config.LOCAL_PORT}")
         print(f"   {e}")
@@ -762,47 +1069,20 @@ def main():
     
     print("[*] Server is running. Press 'q' to quit, or Ctrl+C to stop.\n")
     
-    # Set terminal to raw mode for immediate character reading
-    if platform.system() != 'Windows':
-        import tty
-        import termios
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)  # Use cbreak mode instead of raw
-            
-            try:
-                while True:
-                    import select
-                    if select.select([sys.stdin], [], [], 0.1)[0]:
-                        char = sys.stdin.read(1)
-                        if char and char.lower() == 'q':
-                            print("\n[*] 'q' pressed. Shutting down...")
-                            break
-            except KeyboardInterrupt:
-                print("\n[*] Ctrl+C pressed. Shutting down...")
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            tunnel_manager.stop()
-            server.shutdown()
-            print("[*] Server stopped. Goodbye!")
-    else:
-        # Windows version
-        import msvcrt
-        try:
-            while True:
-                if msvcrt.kbhit():
-                    char = msvcrt.getch().decode('utf-8', errors='ignore')
-                    if char and char.lower() == 'q':
-                        print("\n[*] 'q' pressed. Shutting down...")
-                        break
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            print("\n[*] Ctrl+C pressed. Shutting down...")
-        finally:
-            tunnel_manager.stop()
-            server.shutdown()
-            print("[*] Server stopped. Goodbye!")
+    # Wait for quit command
+    try:
+        while True:
+            char = getch()
+            if char and char.lower() == 'q':
+                print("\n[*] 'q' pressed. Shutting down...")
+                break
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n[*] Ctrl+C pressed. Shutting down...")
+    finally:
+        tunnel_manager.stop()
+        server.shutdown()
+        print("[*] Server stopped. Goodbye!")
 
 
 if __name__ == '__main__':
