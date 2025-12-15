@@ -27,6 +27,8 @@ classifiers = [
 dependencies = [
     "qrcode[pil]",
     "pyngrok",
+    "streaming-form-data",
+    "werkzeug"
 ]
 
 [project.scripts]

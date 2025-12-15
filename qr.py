@@ -7,6 +7,8 @@ Dependencies:
     pip install pyngrok qrcode[pil]
 """
 
+__version__ = "2.0.1"
+
 import os
 import sys
 import threading
@@ -17,8 +19,13 @@ import subprocess
 import re
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, unquote
 from pathlib import Path
+from werkzeug.wsgi import LimitedStream
+from streaming_form_data import StreamingFormDataParser
+from streaming_form_data.targets import FileTarget
+import time
 
 
 def getch():
@@ -50,7 +57,10 @@ class Config:
     LOCAL_PORT = 8000
     CONFIG_DIR = Path.home() / ".qrtunnel"
     CONFIG_FILE = CONFIG_DIR / "config.json"
-    
+
+
+
+
 
 class FileTransferHandler(BaseHTTPRequestHandler):
     """HTTP request handler for file sharing and uploading"""
@@ -68,10 +78,13 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             self.send_upload_page()
         else:
             parsed_path = urlparse(self.path)
-            if parsed_path.path == '/download':
-                self.serve_files_as_zip()
-            else:
+            if parsed_path.path.startswith('/download/'):
+                filename = unquote(parsed_path.path[len('/download/'):])
+                self.serve_single_file(filename)
+            elif parsed_path.path == '/' or parsed_path.path == '/index.html':
                 self.send_download_page()
+            else:
+                self.send_error(404, "Not Found")
 
     def do_POST(self):
         """Handle POST requests for file uploads"""
@@ -81,48 +94,54 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             self.send_error(405, "Method Not Allowed")
 
     def handle_upload(self):
-        """Handle file upload"""
-        content_type = self.headers['Content-Type']
-        if not content_type or not content_type.startswith('multipart/form-data'):
-            self.send_error(400, "Invalid form data")
-            return
+        """Handle file upload with streaming"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            stream = LimitedStream(self.rfile, content_length)
+            
+            parser = StreamingFormDataParser(headers=self.headers)
+            
+            # Create a temporary file for the upload
+            temp_filename = f"upload_{int(time.time())}.tmp"
+            temp_path = Path.cwd() / temp_filename
+            
+            file_target = FileTarget(str(temp_path))
+            parser.register('file', file_target)
 
-        boundary = content_type.split("=")[1].encode()
-        content_length = int(self.headers['Content-Length'])
-        body = self.rfile.read(content_length)
-        
-        parts = body.split(b'--' + boundary)
-        
-        for part in parts:
-            if b'Content-Disposition: form-data;' in part:
-                header, content = part.split(b'\r\n\r\n', 1)
-                
-                # Clean up content
-                content = content.rsplit(b'\r\n', 1)[0]
-                
-                # Extract filename
-                filename_match = re.search(b'filename="(.*?)"', header, re.DOTALL)
-                if filename_match:
-                    filename = filename_match.group(1).decode('utf-8', errors='ignore')
-                    
-                    # Sanitize filename to prevent directory traversal
-                    filename = os.path.basename(filename)
-                    if not filename:
-                        continue # Skip if filename is empty after sanitizing
+            # Feed the data to the parser
+            parser.data_received(stream.read())
 
-                    save_path = Path.cwd() / filename
-                    
-                    try:
-                        with open(save_path, 'wb') as f:
-                            f.write(content)
-                        
-                        print(f"✓ File '{filename}' received and saved to {save_path}")
-                        
-                        # Send styled success response
-                        self.send_response(200)
-                        self.send_header('Content-type', 'text/html')
-                        
-                        success_html = f"""<!DOCTYPE html>
+            # Get the filename from the part headers
+            if not hasattr(file_target, 'filename'):
+                self.send_error(400, "File not found in form data")
+                return
+
+            # Sanitize and rename the file
+            sanitized_filename = os.path.basename(unquote(file_target.filename))
+            if not sanitized_filename:
+                self.send_error(400, "Invalid filename")
+                return
+
+            final_path = Path.cwd() / sanitized_filename
+            os.rename(temp_path, final_path)
+            
+            print(f"✓ File '{sanitized_filename}' received and saved to {final_path}")
+
+            # Send success response
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            success_html = self.get_upload_success_page(sanitized_filename)
+            self.send_header('Content-Length', str(len(success_html)))
+            self.end_headers()
+            self.wfile.write(success_html.encode())
+
+        except Exception as e:
+            print(f"✗ Error during upload: {e}")
+            self.send_error(500, "Internal Server Error")
+
+    def get_upload_success_page(self, filename):
+        """Generate the HTML for the upload success page"""
+        return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -210,17 +229,6 @@ class FileTransferHandler(BaseHTTPRequestHandler):
     </div>
 </body>
 </html>"""
-                        
-                        self.send_header('Content-Length', len(success_html.encode()))
-                        self.end_headers()
-                        self.wfile.write(success_html.encode())
-                        return
-                    except Exception as e:
-                        print(f"✗ Error saving file '{filename}': {e}")
-                        self.send_error(500, "Error saving file")
-                        return
-
-        self.send_error(400, "File not found in form data")
 
     def send_upload_page(self):
         """Send HTML page for file uploading"""
@@ -377,9 +385,12 @@ class FileTransferHandler(BaseHTTPRequestHandler):
 
     
     def send_download_page(self):
-        """Send HTML page with a download button"""
-        file_list_html = "".join(f"<li>{os.path.basename(p)}</li>" for p in self.file_paths)
-        
+        """Send HTML page with individual file download links"""
+        file_list_html = ""
+        for file_path in self.file_paths:
+            filename = os.path.basename(file_path)
+            file_list_html += f'<li><a href="/download/{filename}" class="file-link">{filename}</a></li>'
+
         html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -439,35 +450,22 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             border: 1px solid #2a3a5e;
         }}
         .file-list li {{
-            padding: 12px 16px;
-            font-size: 14px;
-            font-family: 'SF Mono', 'Consolas', monospace;
             border-bottom: 1px solid #2a3a5e;
-            color: #ccc;
         }}
         .file-list li:last-child {{
             border-bottom: none;
         }}
-        .download-button {{
+        .file-link {{
             display: block;
-            width: 100%;
-            padding: 16px 24px;
-            background: #4361ee;
-            color: #fff;
-            border: none;
-            border-radius: 6px;
-            font-size: 15px;
-            font-weight: 500;
-            cursor: pointer;
+            padding: 12px 16px;
+            font-size: 14px;
+            font-family: 'SF Mono', 'Consolas', monospace;
+            color: #ccc;
             text-decoration: none;
-            text-align: center;
-            transition: background 0.2s ease;
+            transition: background-color 0.2s ease;
         }}
-        .download-button:hover {{
-            background: #3a56d4;
-        }}
-        .download-button:active {{
-            background: #324bc2;
+        .file-link:hover {{
+            background-color: #2a3a5e;
         }}
         .footer {{
             text-align: center;
@@ -481,7 +479,7 @@ class FileTransferHandler(BaseHTTPRequestHandler):
     <div class="container">
         <div class="header">
             <h1>Files Ready</h1>
-            <p class="subtitle">Download as ZIP archive</p>
+            <p class="subtitle">Click a file to download</p>
         </div>
         <div class="file-section">
             <p class="file-section-title">Files ({len(self.file_paths)})</p>
@@ -489,7 +487,6 @@ class FileTransferHandler(BaseHTTPRequestHandler):
                 {file_list_html}
             </ul>
         </div>
-        <a href="/download" class="download-button">Download All</a>
         <p class="footer">qrtunnel</p>
     </div>
 </body>
@@ -501,31 +498,38 @@ class FileTransferHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode())
 
-    def serve_files_as_zip(self):
-        """Create a ZIP archive of all files and serve it"""
+    def serve_single_file(self, filename):
+        """Serve a single file for download"""
+        # Find the full path for the requested filename
+        target_path = None
+        for file_path in self.file_paths:
+            if os.path.basename(file_path) == filename:
+                target_path = file_path
+                break
+        
+        if not target_path or not os.path.isfile(target_path):
+            self.send_error(404, "File Not Found")
+            return
+
         try:
-            import zipfile
-            from io import BytesIO
-
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for file_path in self.file_paths:
-                    zipf.write(file_path, os.path.basename(file_path))
-            
-            zip_buffer.seek(0)
-            zip_data = zip_buffer.getvalue()
-
+            file_size = os.path.getsize(target_path)
             self.send_response(200)
-            self.send_header('Content-type', 'application/zip')
-            self.send_header('Content-Disposition', 'attachment; filename="files.zip"')
-            self.send_header('Content-Length', len(zip_data))
+            self.send_header('Content-type', 'application/octet-stream')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Length', str(file_size))
             self.end_headers()
-            self.wfile.write(zip_data)
+
+            with open(target_path, 'rb') as f:
+                while True:
+                    chunk = f.read(16 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
             
-            print(f"✓ Files served as ZIP to {self.client_address[0]}")
+            print(f"✓ File '{filename}' served to {self.client_address[0]}")
         except Exception as e:
-            print(f"✗ Error creating or serving ZIP file: {e}")
-            self.send_error(500, "Internal server error")
+            print(f"✗ Error serving file '{filename}': {e}")
+            self.send_error(500, "Internal Server Error")
 
 
 class NgrokAuth:
