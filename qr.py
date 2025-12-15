@@ -109,7 +109,12 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             parser.register('file', file_target)
 
             # Feed the data to the parser
-            parser.data_received(stream.read())
+            chunk_size = 65536  # 64KB
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    break
+                parser.data_received(chunk)
 
             # Get the filename from the part headers
             if not hasattr(file_target, 'filename'):
@@ -134,6 +139,7 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(success_html)))
             self.end_headers()
             self.wfile.write(success_html.encode())
+            self.close_connection = True
 
         except Exception as e:
             print(f"✗ Error during upload: {e}")
@@ -520,16 +526,21 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             with open(target_path, 'rb') as f:
-                while True:
-                    chunk = f.read(16 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                try:
+                    while True:
+                        chunk = f.read(256 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                except BrokenPipeError:
+                    print(f"✗ Client disconnected during transfer of '{filename}'")
             
             print(f"✓ File '{filename}' served to {self.client_address[0]}")
         except Exception as e:
-            print(f"✗ Error serving file '{filename}': {e}")
-            self.send_error(500, "Internal Server Error")
+            # Don't send another error if it's a broken pipe, as the connection is already gone
+            if not isinstance(e, BrokenPipeError) and "Broken pipe" not in str(e):
+                print(f"✗ Error serving file '{filename}': {e}")
+                self.send_error(500, "Internal Server Error")
 
 
 class NgrokAuth:
