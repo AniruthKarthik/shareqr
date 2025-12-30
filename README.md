@@ -6,8 +6,9 @@ Cross-platform file sharing via SSH reverse tunneling and QR codes. Allows shari
 
 *   **Simple File Sharing:** Share one or more files directly from your command line.
 *   **Receive Files:** Start in upload mode to receive files from any device with a web browser, like your phone.
-*   **Secure Tunnels:** Utilizes ngrok for secure, public HTTPS tunnels, even behind NATs and firewalls.
-*   **No-Auth Alternative:** For Mac/Linux users, an SSH-based tunnel (localhost.run) is available, requiring no ngrok account.
+*   **Secure Tunnels:** Supports both **SSH Tunneling** (default on Linux/macOS) and **ngrok** (default on Windows) for secure, public access even behind NATs/firewalls.
+*   **SSH Tunneling:** Default on Linux/macOS! Uses `localhost.run` for instant tunneling without any account or sign-up.
+*   **Ngrok Support:** Reliable tunneling via ngrok (requires free account), available on all platforms and default on Windows.
 *   **QR Code Display:** Generates a scannable QR code in your terminal for easy access on mobile devices.
 *   **Web Interface:** Provides a simple web page for recipients to download shared files, individually or as a ZIP archive.
 *   **Ngrok Authtoken Management:** Interactive setup and status check for your ngrok authentication token.
@@ -40,7 +41,11 @@ Example:
 qrtunnel mydocument.pdf myimage.jpg
 ```
 
-This will start a local HTTP server, create a public tunnel (using ngrok by default), and display a QR code. Scan the QR code with your phone to access the files.
+This will start a local HTTP server and create a public tunnel.
+*   **Linux/macOS:** Defaults to **SSH tunneling** (no account needed).
+*   **Windows:** Defaults to **ngrok** (requires account setup).
+
+Scan the QR code with your phone to access the files.
 
 ### Receiving Files (Phone to PC)
 
@@ -52,9 +57,30 @@ qrtunnel
 
 This starts the server in upload mode. Scan the generated QR code on your phone, and you'll get a web page where you can select and upload a file to your computer.
 
+### Tunnel Selection (Ngrok vs SSH)
+
+`qrtunnel` supports two tunneling methods: **SSH (localhost.run)** and **ngrok**.
+
+#### On Linux / macOS:
+*   **Default:** SSH Tunneling (No sign-up required).
+    ```bash
+    qrtunnel <files>
+    ```
+*   **Use Ngrok:** To use ngrok instead (more stable, requires account):
+    ```bash
+    qrtunnel <files> --ngrok
+    ```
+
+#### On Windows:
+*   **Default:** Ngrok (Requires account).
+    ```bash
+    qrtunnel <files>
+    ```
+*   **SSH Tunneling:** Not reliably supported on Windows.
+
 ### Ngrok Authentication Setup
 
-`qrtunnel` uses ngrok for reliable public tunnels. The first time you use it, or if you need to update your token, you'll be prompted to set up your ngrok authtoken. You can also do this manually:
+If you use ngrok (default on Windows, optional on Linux/macOS), you'll need to set up your authtoken once:
 
 ```bash
 qrtunnel --setup
@@ -70,15 +96,6 @@ To check if your ngrok authtoken is configured:
 qrtunnel --status
 ```
 
-### No-Auth Sharing (Mac/Linux Only)
-
-If you're on Mac or Linux and prefer not to use an ngrok account, you can use the `--noauth` flag. This will attempt to create an SSH tunnel via `localhost.run`.
-
-```bash
-qrtunnel <file_path1> [<file_path2> ...] --noauth
-```
-
-**Note:** This option is not supported on Windows.
 ### Quitting the Server
 
 The server will run until you press `q` in the terminal or use `Ctrl+C`.

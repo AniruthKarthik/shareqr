@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-qrtunnel: Simple cross-platform file sharing via QR code with ngrok authentication.
-Usage: qrtunnel <file_path1> [<file_path2> ...]
+qrtunnel: Simple cross-platform file sharing via QR code.
+Features account-free SSH tunneling (default on Linux/macOS) and ngrok support.
 
-Dependencies:
-    pip install pyngrok qrcode streaming-form-data werkzeug
+Usage: qrtunnel <file_path1> [<file_path2> ...]
+       qrtunnel (for upload mode)
 """
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 import os
 import sys
@@ -605,15 +605,15 @@ class NgrokAuth:
         print("   2. Sign up for a FREE account (email required)")
         print("   3. Copy your authtoken from: https://dashboard.ngrok.com/get-started/your-authtoken")
         
-        # Show no-auth alternative on Mac/Linux
+        # Show default SSH alternative on Mac/Linux
         if platform.system() != 'Windows':
             print("\n" + "-"*60)
-            print("💡 ALTERNATIVE: No Sign-up Required!")
+            print("💡 TIP: No Sign-up Required by Default")
             print("-"*60)
-            print("If you don't want to sign up for ngrok, you can use the")
-            print("--noauth flag which uses SSH tunneling (localhost.run):")
-            print("\n   qrtunnel <files> --noauth")
-            print("\nThis requires no authentication or sign-up!")
+            print("On Linux/macOS, qrtunnel uses SSH tunneling by default.")
+            print("You only need to set up ngrok if you specifically want to use it.")
+            print("To use the default mode without account, run without --ngrok:")
+            print("\n   qrtunnel <files>")
             print("-"*60)
         
         print("\n" + "="*60)
@@ -637,7 +637,7 @@ class NgrokAuth:
             print("  1. Sign up at: https://dashboard.ngrok.com/signup")
             print("  2. Run 'qrtunnel --setup' after you get your authtoken")
             if platform.system() != 'Windows':
-                print("  3. OR use: qrtunnel <files> --noauth (no sign-up needed!)")
+                print("  3. OR use default SSH mode: qrtunnel <files> (no sign-up needed!)")
             return None
     
     def verify_token(self, token):
@@ -674,14 +674,14 @@ class NgrokTunnel:
             if not authtoken:
                 print("[!] No ngrok authtoken found")
                 
-                # Show helpful message about --noauth alternative
+                # Show helpful message about default SSH mode
                 if platform.system() != 'Windows':
                     print("\n" + "="*60)
                     print("💡 TIP: You can skip ngrok sign-up!")
                     print("="*60)
-                    print("\nRestart the program with --noauth flag to use SSH tunneling")
-                    print("(localhost.run) which requires NO authentication or sign-up:")
-                    print("\n   qrtunnel <your_files> --noauth")
+                    print("\nSimply run qrtunnel without the --ngrok flag to use")
+                    print("the default SSH tunneling (no authentication required):")
+                    print("\n   qrtunnel <your_files>")
                     print("\nOr continue below to set up ngrok (requires free account).")
                     print("="*60 + "\n")
                 
@@ -690,8 +690,8 @@ class NgrokTunnel:
                 if not authtoken:
                     print("[!] Cannot start ngrok without authtoken")
                     if platform.system() != 'Windows':
-                        print("\n💡 Remember: You can use --noauth to skip authentication!")
-                        print("   Example: qrtunnel myfile.pdf --noauth")
+                        print("\n💡 Remember: Run without --ngrok to skip authentication!")
+                        print("   Example: qrtunnel myfile.pdf")
                     return False
             
             # Set authtoken
@@ -731,13 +731,13 @@ class NgrokTunnel:
                 print(f"✗ Authentication error: {e}")
                 print("\n[*] Your authtoken might be invalid or expired.")
                 
-                # Show --noauth alternative
+                # Show default SSH alternative
                 if platform.system() != 'Windows':
                     print("\n" + "="*60)
                     print("💡 ALTERNATIVE: Skip authentication entirely!")
                     print("="*60)
-                    print("\nYou can restart with --noauth to use SSH tunneling:")
-                    print("\n   qrtunnel <your_files> --noauth")
+                    print("\nYou can restart without --ngrok to use default SSH tunneling:")
+                    print("\n   qrtunnel <your_files>")
                     print("\nNo sign-up or authentication required!")
                     print("="*60)
                 
@@ -757,7 +757,7 @@ class NgrokTunnel:
                     except Exception as retry_error:
                         print(f"✗ Still failed: {retry_error}")
                         if platform.system() != 'Windows':
-                            print("\n💡 Try restarting with: qrtunnel <files> --noauth")
+                            print("\n💡 Try restarting without --ngrok")
                         return False
                 return False
             else:
@@ -917,9 +917,9 @@ class TunnelManager:
         print("="*60)
         print("\n✗ All tunnel services failed")
         print("\n[SOLUTIONS]:")
-        if platform.system() != 'Windows':
-            print("  1. 🚀 EASIEST: Restart with --noauth (no sign-up required!)")
-            print("     Example: qrtunnel <your_files> --noauth")
+        if platform.system() != 'Windows' and not self.noauth:
+            print("  1. 🚀 EASIEST: Restart without --ngrok to try SSH tunneling")
+            print("     Example: qrtunnel <your_files>")
             print()
         print("  2. Make sure you have a valid ngrok authtoken")
         print("  3. Run: qrtunnel --setup (to configure ngrok)")
@@ -976,14 +976,15 @@ def format_size(bytes):
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="qrtunnel: Simple cross-platform file sharing and receiving via QR code.",
+        description="qrtunnel: Simple cross-platform file sharing and receiving via QR code. Defaults to account-free SSH tunneling on Linux/macOS.",
         usage="""qrtunnel [file_path1] [file_path2] ... [options]
        qrtunnel (starts in upload mode)"""
     )
     parser.add_argument('file_paths', nargs='*', help='One or more paths to files to share. If no files are provided, starts in upload mode.')
     parser.add_argument('--setup', action='store_true', help='Set up or reconfigure ngrok authtoken')
     parser.add_argument('--status', action='store_true', help='Check authentication status')
-    parser.add_argument('--noauth', action='store_true', help='Use SSH tunnel (localhost.run) without authentication (recommended for non-Windows)')
+    parser.add_argument('--ngrok', action='store_true', help='Use ngrok for tunneling (Default on Windows)')
+    parser.add_argument('--noauth', action='store_true', help='Use SSH tunnel (localhost.run) (Default on Linux/macOS)')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     
     args = parser.parse_args()
@@ -1020,17 +1021,23 @@ def main():
     # Determine mode (upload or download)
     upload_mode = not args.file_paths
     
-    # Handle --noauth on Windows
-    noauth_mode = args.noauth
-    if noauth_mode and platform.system() == 'Windows':
-        print("\n" + "="*60)
-        print("⚠️  WARNING: --noauth is not supported on Windows")
-        print("="*60)
-        print("\nThe --noauth option uses SSH tunneling via localhost.run,")
-        print("which is not reliably supported on Windows.")
-        print("\nProceeding with ngrok instead...")
-        print("="*60)
+    # Determine tunnel mode
+    if platform.system() == 'Windows':
+        # Windows defaults to ngrok
         noauth_mode = False
+        if args.noauth:
+            print("\n" + "="*60)
+            print("⚠️  WARNING: --noauth is not supported on Windows")
+            print("="*60)
+            print("The --noauth option uses SSH tunneling which is not reliably supported on Windows.")
+            print("Proceeding with ngrok instead...")
+            print("="*60)
+    else:
+        # Linux/macOS defaults to SSH (noauth) unless --ngrok is specified
+        if args.ngrok:
+            noauth_mode = False
+        else:
+            noauth_mode = True
     
     # Validate files in download mode
     if not upload_mode:
