@@ -122,12 +122,12 @@ class FileTransferHandler(BaseHTTPRequestHandler):
                 parser.data_received(chunk)
 
             # Get the filename from the part headers
-            if not hasattr(file_target, 'filename'):
+            if not getattr(file_target, 'multipart_filename', None):
                 self.send_error(400, "File not found in form data")
                 return
 
             # Sanitize and rename the file
-            sanitized_filename = os.path.basename(unquote(file_target.filename))
+            sanitized_filename = os.path.basename(unquote(file_target.multipart_filename))
             if not sanitized_filename:
                 self.send_error(400, "Invalid filename")
                 return
