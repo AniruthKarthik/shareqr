@@ -27,6 +27,9 @@ import re
 import json
 import socket
 import ipaddress
+import random
+import uuid
+import http.cookies
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
 from pathlib import Path
@@ -34,7 +37,6 @@ from socketserver import ThreadingMixIn
 from werkzeug.wsgi import LimitedStream
 from streaming_form_data import StreamingFormDataParser
 from streaming_form_data.targets import FileTarget
-import time
 
 
 # Terminal colors and icons
@@ -84,8 +86,97 @@ def getch():
 class Config:
     """Configuration constants"""
     LOCAL_PORT = 8000
+    OTP = None
     CONFIG_DIR = Path.home() / ".qrtunnel"
     CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+class HotspotHelper:
+    """Helper for Wi-Fi Hotspot configuration and QR generation"""
+    
+    def __init__(self):
+        self.config_file = Config.CONFIG_FILE
+        
+    def load_config(self):
+        """Load configuration from file"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {}
+
+    def save_config(self, config):
+        """Save configuration to file"""
+        Config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+
+    def setup_interactive(self):
+        """Interactive setup for Hotspot credentials"""
+        print("\n" + "="*60)
+        print("WI-FI HOTSPOT SETUP")
+        print("="*60)
+        print("Store your Hotspot/Wi-Fi credentials securely to generate")
+        print("Quick-Join QR codes for your other devices.")
+        print("-" * 60)
+        
+        try:
+            ssid = input("SSID (Network Name): ").strip()
+            if not ssid:
+                print(f"{ERR} SSID cannot be empty.")
+                return
+
+            print("\nSecurity Type:")
+            print("  1. WPA/WPA2/WPA3 (Most common)")
+            print("  2. WEP (Old)")
+            print("  3. None (Open)")
+            sec_choice = input("Select [1-3] (default 1): ").strip()
+            
+            security = "WPA"
+            if sec_choice == '2': security = "WEP"
+            elif sec_choice == '3': security = "nopass"
+            
+            password = ""
+            if security != "nopass":
+                password = input("Password: ").strip()
+            
+            config = self.load_config()
+            config['hotspot'] = {
+                'ssid': ssid,
+                'password': password,
+                'security': security
+            }
+            self.save_config(config)
+            print(f"\n{OK} Hotspot configuration saved.")
+            print(f"   Config location: {self.config_file}")
+            
+        except KeyboardInterrupt:
+            print("\n\n[*] Setup cancelled.")
+
+    def get_qr_data(self):
+        """Get hotspot data for QR code"""
+        config = self.load_config().get('hotspot')
+        if not config: return None
+        
+        ssid = config.get('ssid')
+        password = config.get('password', '')
+        security = config.get('security', 'WPA')
+        
+        if not ssid: return None
+        
+        # Escape special characters for WIFI string format
+        # standard: escape \ ; , :
+        def escape(s):
+            return s.replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace(':', '\\:')
+            
+        qr_str = f"WIFI:T:{security};S:{escape(ssid)};"
+        if security != 'nopass':
+            qr_str += f"P:{escape(password)};"
+        qr_str += "H:false;;"
+        
+        return qr_str, ssid, password
 
 
 def get_lan_ip():
@@ -162,6 +253,136 @@ class FileTransferHandler(BaseHTTPRequestHandler):
     upload_mode = False
     server_lan_ip = None
     
+    # Security: Authorized session tokens
+    authorized_sessions = set()
+
+    def check_auth(self):
+        """Check if request is authorized (LAN requires password, Tunnel/Localhost does not)"""
+        # 1. Allow localhost (Tunnel agent or local user)
+        if self.client_address[0] in ["127.0.0.1", "::1"]:
+            return True
+        
+        # 2. Allow ping for discovery (returns 1x1 GIF)
+        if self.path == '/ping' or self.path.startswith('/ping?'):
+            return True
+            
+        # 3. Check Cookie for valid session
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            try:
+                cookies = http.cookies.SimpleCookie(cookie_header)
+                if 'session' in cookies:
+                    token = cookies['session'].value
+                    if token in self.authorized_sessions:
+                        return True
+            except:
+                pass
+        
+        return False
+
+    def handle_login(self):
+        """Handle login form submission"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            from urllib.parse import parse_qs
+            params = parse_qs(post_data)
+            password = params.get('password', [''])[0]
+            
+            if password == Config.OTP:
+                # Generate session token
+                session_token = str(uuid.uuid4())
+                self.authorized_sessions.add(session_token)
+                
+                # Set cookie and redirect
+                self.send_response(303) # See Other
+                self.send_header('Location', '/')
+                self.send_header('Set-Cookie', f'session={session_token}; Path=/; HttpOnly; Max-Age=86400')
+                self.end_headers()
+                print(f"{OK} Auth success from {self.client_address[0]}")
+            else:
+                print(f"{WRN} Failed auth attempt from {self.client_address[0]}")
+                self.send_login_page(error="Incorrect password")
+                
+        except Exception as e:
+            print(f"{ERR} Auth error: {e}")
+            self.send_error(500, "Internal Server Error")
+
+    def send_login_page(self, error=None):
+        """Send password entry page"""
+        error_html = f'<p class="error">{error}</p>' if error else ''
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>qrtunnel - Security Check</title>
+    <style>
+        body {{
+            font-family: -apple-system, system-ui, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }}
+        .box {{
+            background: #16213e;
+            padding: 40px;
+            border-radius: 8px;
+            text-align: center;
+            width: 100%;
+            max-width: 320px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }}
+        input {{
+            width: 100%;
+            padding: 12px;
+            margin: 20px 0;
+            background: #0f0f1a;
+            border: 1px solid #2a3a5e;
+            color: white;
+            border-radius: 4px;
+            font-size: 18px;
+            text-align: center;
+            letter-spacing: 2px;
+        }}
+        button {{
+            width: 100%;
+            padding: 12px;
+            background: #4361ee;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+        }}
+        button:hover {{ background: #3a56d4; }}
+        .error {{ color: #ff4757; margin-bottom: 10px; }}
+        h2 {{ margin-top: 0; }}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>🔒 Restricted Access</h2>
+        <p>Please enter the 6-digit code shown on the host screen.</p>
+        {error_html}
+        <form action="/login" method="post">
+            <input type="text" name="password" pattern="[0-9]*" inputmode="numeric" placeholder="000000" maxlength="6" required autofocus autocomplete="off">
+            <button type="submit">Verify</button>
+        </form>
+    </div>
+</body>
+</html>"""
+        self.send_response(200 if not error else 403)
+        self.send_header('Content-type', 'text/html')
+        self.send_header('Content-Length', str(len(html)))
+        self.end_headers()
+        self.wfile.write(html.encode())
+    
     def log_message(self, format, *args):
         """Suppress default logging and show smart connection info"""
         client_ip = self.client_address[0]
@@ -178,6 +399,10 @@ class FileTransferHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle GET requests"""
+        if not self.check_auth():
+            self.send_login_page()
+            return
+
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/ping':
             self.send_ping_gif()
@@ -239,6 +464,14 @@ class FileTransferHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Handle POST requests for file uploads"""
+        if self.path == '/login':
+            self.handle_login()
+            return
+            
+        if not self.check_auth():
+            self.send_login_page()
+            return
+
         if self.upload_mode:
             self.handle_upload()
         else:
@@ -1070,6 +1303,7 @@ class SSHTunnel:
             '-o', 'ServerAliveInterval=60',
             '-o', 'ConnectTimeout=15',
             '-o', 'LogLevel=ERROR',
+            '-o', 'AddressFamily=inet',
             '-T',
             '-R', f'80:localhost:{self.local_port}',
             'nokey@localhost.run'
@@ -1121,20 +1355,22 @@ class SSHTunnel:
 class TunnelManager:
     """Manages tunnel services and LAN discovery"""
     
-    def __init__(self, local_port, noauth=False, lan_only=False):
+    def __init__(self, local_port, noauth=False, lan_only=False, lan_ip=None):
         self.local_port = local_port
         self.active_tunnel = None
         self.public_url = None
         self.lan_url = None
-        self.lan_ip = None
+        self.lan_ip = lan_ip
         self.auth_manager = NgrokAuth()
         self.noauth = noauth
         self.lan_only = lan_only
         
     def start(self):
         """Start services. In Smart Mode (default), both LAN and Tunnel are prepared."""
-        # 1. Detect LAN IP
-        self.lan_ip = get_lan_ip()
+        # 1. Detect LAN IP if not provided
+        if not self.lan_ip:
+            self.lan_ip = get_lan_ip()
+            
         if self.lan_ip:
             self.lan_url = f"http://{self.lan_ip}:{self.local_port}"
         
@@ -1238,6 +1474,13 @@ def generate_qr_code(primary_url, fallback_url=None):
             qr.print_ascii(invert=True)
             print("="*60)
             print(f"\n{INFO} URL: {qr_url}")
+            
+        # Display OTP clearly at the end
+        if Config.OTP:
+            print("-" * 60)
+            print(f"🔒 LAN PASSWORD: {CLR_G}{Config.OTP}{CLR_RST}")
+            print("-" * 60)
+            
         print("="*60 + "\n")
         
     except ImportError:
@@ -1269,6 +1512,7 @@ def main():
     )
     parser.add_argument('file_paths', nargs='*', help='One or more paths to files to share. If no files are provided, starts in upload mode.')
     parser.add_argument('--setup', action='store_true', help='Set up or reconfigure ngrok authtoken')
+    parser.add_argument('--setup-hotspot', action='store_true', help='Configure Wi-Fi Hotspot credentials for Quick-Join QR')
     parser.add_argument('--status', action='store_true', help='Check authentication status')
     parser.add_argument('--ngrok', action='store_true', help='Use ngrok for tunneling (Default on Windows)')
     parser.add_argument('--noauth', action='store_true', help='Use SSH tunnel (localhost.run) (Default on Linux/macOS)')
@@ -1277,6 +1521,16 @@ def main():
     
     args = parser.parse_args()
     
+    # Security Setup: Random Port & OTP
+    Config.LOCAL_PORT = random.randint(20000, 60000)
+    Config.OTP = f"{random.randint(0, 999999):06d}"
+    
+    # Handle hotspot setup
+    if args.setup_hotspot:
+        helper = HotspotHelper()
+        helper.setup_interactive()
+        sys.exit(0)
+
     # Handle setup mode
     if args.setup:
         auth = NgrokAuth()
@@ -1342,6 +1596,8 @@ def main():
     print("\n" + "="*60)
     print("qrtunnel - Simple File Transfer")
     print(f"Platform: {platform.system()} {platform.release()}")
+    print(f"Port:     {Config.LOCAL_PORT}")
+    print(f"Security: LAN Access Code -> [{CLR_G}{Config.OTP}{CLR_RST}]")
 
     if upload_mode:
         print("Mode: Upload (receive files)")
@@ -1366,12 +1622,56 @@ def main():
         print("="*60)
 
     # Set up tunnel manager first to get LAN IP
-    tunnel_manager = TunnelManager(Config.LOCAL_PORT, noauth=noauth_mode, lan_only=args.lan)
+    # First check if we have LAN connectivity. If not, offer Hotspot flow.
+    current_lan_ip = get_lan_ip()
+    
+    if not current_lan_ip and not args.lan: # Only check if not already forced to LAN mode (which would just fail)
+        hotspot_helper = HotspotHelper()
+        qr_data = hotspot_helper.get_qr_data()
+        
+        if qr_data:
+            qr_string, ssid, password = qr_data
+            
+            print("\n" + "="*60)
+            print(f"{INFO} 📡 Faster local transfer available")
+            print("Turn on your phone hotspot and scan this QR to connect your laptop automatically:")
+            # Note: OS confirmation is always required for joining networks.
+            # iOS may not always auto-join; users may need to tap "Join".
+            print("="*60)
+            
+            try:
+                import qrcode
+                qr = qrcode.QRCode()
+                qr.add_data(qr_string)
+                qr.make(fit=True)
+                qr.print_ascii(invert=True)
+            except ImportError:
+                print(f"{WRN} qrcode library not installed. Cannot display QR.")
+            
+            print("="*60)
+            print(f"SSID:     {ssid}")
+            print(f"Password: {password}")
+            print("="*60)
+            print(f"{INFO} Waiting for connection... (checking for LAN IP)")
+            
+            # Wait loop - re-check connectivity
+            try:
+                for i in range(15): # Wait ~30 seconds
+                    time.sleep(2)
+                    new_ip = get_lan_ip()
+                    if new_ip:
+                        print(f"\n{OK} LAN Connection Detected: {new_ip}")
+                        current_lan_ip = new_ip
+                        break
+            except KeyboardInterrupt:
+                print("\nSkipping LAN wait...")
+
+    tunnel_manager = TunnelManager(Config.LOCAL_PORT, noauth=noauth_mode, lan_only=args.lan, lan_ip=current_lan_ip)
     
     # Set up handler
     FileTransferHandler.file_paths = args.file_paths if not upload_mode else None
     FileTransferHandler.upload_mode = upload_mode
-    FileTransferHandler.server_lan_ip = get_lan_ip() # Pre-detect for handler
+    FileTransferHandler.server_lan_ip = current_lan_ip # Use pre-detected IP
     
     # Start HTTP server
     # We bind to 0.0.0.0 to be accessible from LAN
