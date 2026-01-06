@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qrtunnel"
-version = "3.0.0"
+version = "3.1.0"
 description = "Cross-platform file sharing via QR code. Defaults to account-free SSH tunneling on Linux/macOS."
 readme = "README.md"
 requires-python = ">=3.6"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     { name = "Aniruth Karthik", email = "aniruthkarthik10@gmail.com" }
 ]
@@ -21,7 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Operating System :: OS Independent",
-    "License :: OSI Approved :: MIT License",
 ]
 
 dependencies = [

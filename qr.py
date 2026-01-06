@@ -3,6 +3,13 @@
 qrtunnel: Simple cross-platform file sharing via QR code.
 Features account-free SSH tunneling (default on Linux/macOS) and ngrok support.
 
+Smart Mode Limitations:
+- AP Isolation: Some guest Wi-Fi networks prevent devices from talking to each other.
+- Firewalls: The host computer must allow incoming traffic on the local port (default 8000).
+- Subnets/VLANs: Heuristic assumes a /24 subnet. If client and server are on different
+  local subnets, Smart Mode will correctly fall back to the Internet tunnel.
+- VPNs: Active VPNs may interfere with LAN IP detection or routing.
+
 Usage: qrtunnel <file_path1> [<file_path2> ...]
        qrtunnel (for upload mode)
 """
@@ -19,6 +26,7 @@ import subprocess
 import re
 import json
 import socket
+import ipaddress
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
 from pathlib import Path
@@ -27,6 +35,21 @@ from werkzeug.wsgi import LimitedStream
 from streaming_form_data import StreamingFormDataParser
 from streaming_form_data.targets import FileTarget
 import time
+
+
+# Terminal colors and icons
+CLR_G = "\033[92m"  # Green
+CLR_Y = "\033[93m"  # Yellow
+CLR_R = "\033[91m"  # Red
+CLR_B = "\033[94m"  # Blue
+CLR_RST = "\033[0m" # Reset
+DOT = "●"
+
+# Success/Error/Warning markers
+OK = f"{CLR_G}{DOT}{CLR_RST}"
+ERR = f"{CLR_R}{DOT}{CLR_RST}"
+WRN = f"{CLR_Y}{DOT}{CLR_RST}"
+INFO = f"{CLR_B}{DOT}{CLR_RST}"
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -66,7 +89,7 @@ class Config:
 
 
 def get_lan_ip():
-    """Get the primary LAN IP address of the host."""
+    """Get the primary LAN IP address of the host (IPv4 preferred)."""
     try:
         # Create a dummy socket to determine the preferred interface
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -74,13 +97,59 @@ def get_lan_ip():
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        
+        addr = ipaddress.ip_address(ip)
+        if addr.is_private and not addr.is_loopback:
+            return str(ip)
     except Exception:
-        # Fallback to hostname-based detection
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except Exception:
-            return None
+        pass
+        
+    # Fallback to hostname-based detection
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            addr = ipaddress.ip_address(ip)
+            if addr.is_private and not addr.is_loopback:
+                return str(ip)
+    except Exception:
+        pass
+    return None
+
+
+def is_same_lan(client_ip, server_ip):
+    """
+    Check if the client IP is on the same LAN as the server IP.
+    Uses private IP ranges, subnet heuristics, and optional ARP check.
+    """
+    try:
+        c_ip = ipaddress.ip_address(client_ip)
+        s_ip = ipaddress.ip_address(server_ip)
+
+        # 1. Basic check: both must be private
+        if not (c_ip.is_private and s_ip.is_private):
+            return False
+
+        # 2. If they are exactly the same, it's the host itself
+        if c_ip == s_ip:
+            return True
+
+        # 3. ARP check (Linux only) - strongest confirmation of local adjacency
+        if platform.system() == 'Linux':
+            try:
+                with open('/proc/net/arp', 'r') as f:
+                    arp_table = f.read()
+                    if client_ip in arp_table:
+                        return True
+            except:
+                pass
+
+        # 4. Subnet heuristic: same /24 is common for home/small office LANs
+        # Without knowing the exact netmask, we assume /24 as it is the most 
+        # frequent configuration.
+        c_net = ipaddress.ip_network(f"{client_ip}/24", strict=False)
+        return s_ip in c_net
+    except:
+        return False
 
 
 
@@ -91,17 +160,30 @@ class FileTransferHandler(BaseHTTPRequestHandler):
     
     file_paths = None
     upload_mode = False
+    server_lan_ip = None
     
     def log_message(self, format, *args):
-        """Suppress default logging"""
-        pass
+        """Suppress default logging and show smart connection info"""
+        client_ip = self.client_address[0]
+        is_local = client_ip == "127.0.0.1" or client_ip == "::1"
+        if is_local or (self.server_lan_ip and is_same_lan(client_ip, self.server_lan_ip)):
+            conn_type = f"{OK} LAN"
+        else:
+            conn_type = f"{INFO} Tunnel"
+        
+        # Only log significant requests (downloads/uploads)
+        path = self.path
+        if "/download/" in path or "/upload" in path or path == "/":
+            print(f"[*] {conn_type} request from {client_ip}: {path}")
 
     def do_GET(self):
         """Handle GET requests"""
-        if self.upload_mode:
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/ping':
+            self.send_ping_gif()
+        elif self.upload_mode:
             self.send_upload_page()
         else:
-            parsed_path = urlparse(self.path)
             if parsed_path.path.startswith('/download/'):
                 filename = unquote(parsed_path.path[len('/download/'):])
                 self.serve_single_file(filename)
@@ -109,6 +191,51 @@ class FileTransferHandler(BaseHTTPRequestHandler):
                 self.send_download_page()
             else:
                 self.send_error(404, "Not Found")
+
+    def send_ping_gif(self):
+        """Send a 1x1 transparent GIF for LAN detection"""
+        gif = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+        self.send_response(200)
+        self.send_header('Content-type', 'image/gif')
+        self.send_header('Content-Length', len(gif))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Private-Network', 'true')
+        self.end_headers()
+        self.wfile.write(gif)
+
+    def get_smart_redirect_js(self):
+        """Generate JS for automatic LAN redirection"""
+        lan_ip = str(self.server_lan_ip) if self.server_lan_ip else ""
+        if not lan_ip or lan_ip == "None" or lan_ip == "127.0.0.1":
+            return ""
+        
+        return f"""
+    <script>
+        (function() {{
+            var lanIp = "{lan_ip}";
+            var lanPort = {Config.LOCAL_PORT};
+            var lanUrl = "http://" + lanIp + ":" + lanPort;
+            
+            // Only attempt redirect if we are NOT already on the LAN IP
+            if (window.location.hostname !== lanIp) {{
+                console.log("Checking LAN connectivity to " + lanUrl + "...");
+                var img = new Image();
+                img.onload = function() {{
+                    console.log("LAN detected! Redirecting to high-speed link...");
+                    // Small delay to ensure browser can handle the navigation
+                    setTimeout(function() {{
+                        window.location.href = lanUrl + window.location.pathname + window.location.search;
+                    }}, 100);
+                }};
+                img.onerror = function() {{
+                    console.log("LAN IP found but unreachable (firewall, AP isolation, or different subnet).");
+                }};
+                // Try to load a tiny image from the LAN server
+                img.src = lanUrl + "/ping?t=" + Date.now();
+            }}
+        }})();
+    </script>
+        """
 
     def do_POST(self):
         """Handle POST requests for file uploads"""
@@ -154,7 +281,7 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             final_path = Path.cwd() / sanitized_filename
             os.rename(temp_path, final_path)
             
-            print(f"✓ File '{sanitized_filename}' received and saved to {final_path}")
+            print(f"{OK} File '{sanitized_filename}' received and saved to {final_path}")
 
             # Send success response
             self.send_response(200)
@@ -166,7 +293,7 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
         except Exception as e:
-            print(f"✗ Error during upload: {e}")
+            print(f"{ERR} Error during upload: {e}")
             self.send_error(500, "Internal Server Error")
 
     def get_upload_success_page(self, filename):
@@ -262,15 +389,16 @@ class FileTransferHandler(BaseHTTPRequestHandler):
 
     def send_upload_page(self):
         """Send HTML page for file uploading"""
-        html = """<!DOCTYPE html>
+        lan_ip = str(self.server_lan_ip) if self.server_lan_ip else ""
+        html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>qrtunnel - File Upload</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #1a1a2e;
             min-height: 100vh;
@@ -279,37 +407,37 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             justify-content: center;
             padding: 20px;
             color: #eee;
-        }
-        .container {
+        }}
+        .container {{
             background: #16213e;
             border-radius: 8px;
             padding: 40px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.4);
             max-width: 480px;
             width: 100%;
-        }
-        .header {
+        }}
+        .header {{
             text-align: center;
             margin-bottom: 32px;
             padding-bottom: 24px;
             border-bottom: 1px solid #2a3a5e;
-        }
-        h1 {
+        }}
+        h1 {{
             font-size: 24px;
             font-weight: 600;
             margin-bottom: 8px;
             color: #fff;
-        }
-        .subtitle {
+        }}
+        .subtitle {{
             font-size: 14px;
             color: #888;
-        }
-        .upload-form {
+        }}
+        .upload-form {{
             display: flex;
             flex-direction: column;
             gap: 20px;
-        }
-        .file-input-wrapper {
+        }}
+        .file-input-wrapper {{
             position: relative;
             width: 100%;
             padding: 16px 24px;
@@ -319,31 +447,31 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             text-align: center;
             cursor: pointer;
             transition: background 0.2s ease, border-color 0.2s ease;
-        }
-        .file-input-wrapper:hover {
+        }}
+        .file-input-wrapper:hover {{
             background: #1f1f2a;
             border-color: #5a78ff;
-        }
-        #file-input {
+        }}
+        #file-input {{
             opacity: 0;
             position: absolute;
             top: 0; left: 0;
             width: 100%;
             height: 100%;
             cursor: pointer;
-        }
-        .file-input-label {
+        }}
+        .file-input-label {{
             font-size: 14px;
             font-weight: 500;
             color: #ccc;
-        }
-        #file-name {
+        }}
+        #file-name {{
             margin-top: 12px;
             font-size: 12px;
             font-family: 'SF Mono', 'Consolas', monospace;
             color: #888;
-        }
-        .submit-button {
+        }}
+        .submit-button {{
             display: block;
             width: 100%;
             padding: 16px 24px;
@@ -358,20 +486,20 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             transition: background 0.2s ease;
             opacity: 0.5;
             pointer-events: none;
-        }
-        .submit-button.enabled {
+        }}
+        .submit-button.enabled {{
             opacity: 1;
             pointer-events: auto;
-        }
-        .submit-button:hover.enabled {
+        }}
+        .submit-button:hover.enabled {{
             background: #3a56d4;
-        }
-        .footer {
+        }}
+        .footer {{
             text-align: center;
             margin-top: 24px;
             font-size: 12px;
             color: #555;
-        }
+        }}
     </style>
 </head>
 <body>
@@ -388,6 +516,10 @@ class FileTransferHandler(BaseHTTPRequestHandler):
             </div>
             <button type="submit" id="submit-btn" class="submit-button">Upload</button>
         </form>
+        <div id="lan-discovery" style="margin-top: 20px; text-align: center; display: none;">
+            <p style="font-size: 13px; color: #4CAF50; margin-bottom: 10px;">Same Wi-Fi detected!</p>
+            <a id="lan-btn" href="#" style="font-size: 14px; color: #4361ee; text-decoration: none; border: 1px solid #4361ee; padding: 8px 16px; border-radius: 4px;">Switch to High Speed</a>
+        </div>
         <p class="footer">qrtunnel</p>
     </div>
     <script>
@@ -395,16 +527,34 @@ class FileTransferHandler(BaseHTTPRequestHandler):
         const fileNameDisplay = document.getElementById('file-name');
         const submitButton = document.getElementById('submit-btn');
 
-        fileInput.addEventListener('change', () => {
-            if (fileInput.files.length > 0) {
-                fileNameDisplay.textContent = `Selected: ${fileInput.files[0].name}`;
+        fileInput.addEventListener('change', () => {{
+            if (fileInput.files.length > 0) {{
+                fileNameDisplay.textContent = `Selected: ${{fileInput.files[0].name}}`;
                 submitButton.classList.add('enabled');
-            } else {
+            }} else {{
                 fileNameDisplay.textContent = '';
                 submitButton.classList.remove('enabled');
-            }
-        });
+            }}
+        }});
+
+        // Manual LAN switch helper
+        (function() {{
+            var lanIp = "{lan_ip}";
+            var lanPort = {Config.LOCAL_PORT};
+            var lanUrl = "http://" + lanIp + ":" + lanPort;
+            if (lanIp && lanIp !== "None" && window.location.hostname !== lanIp) {{
+                var discoveryDiv = document.getElementById('lan-discovery');
+                var lanBtn = document.getElementById('lan-btn');
+                var img = new Image();
+                img.onload = function() {{
+                    discoveryDiv.style.display = 'block';
+                    lanBtn.href = lanUrl + window.location.pathname + window.location.search;
+                }};
+                img.src = lanUrl + "/ping?t=" + Date.now();
+            }}
+        }})();
     </script>
+    {self.get_smart_redirect_js()}
 </body>
 </html>"""
         self.send_response(200)
@@ -416,6 +566,7 @@ class FileTransferHandler(BaseHTTPRequestHandler):
     
     def send_download_page(self):
         """Send HTML page with individual file download links"""
+        lan_ip = str(self.server_lan_ip) if self.server_lan_ip else ""
         file_list_html = ""
         for file_path in self.file_paths:
             filename = os.path.basename(file_path)
@@ -517,8 +668,30 @@ class FileTransferHandler(BaseHTTPRequestHandler):
                 {file_list_html}
             </ul>
         </div>
+        <div id="lan-discovery" style="margin-top: 20px; text-align: center; display: none;">
+            <p style="font-size: 13px; color: #4CAF50; margin-bottom: 10px;">Same Wi-Fi detected!</p>
+            <a id="lan-btn" href="#" style="font-size: 14px; color: #4361ee; text-decoration: none; border: 1px solid #4361ee; padding: 8px 16px; border-radius: 4px;">Switch to High Speed</a>
+        </div>
         <p class="footer">qrtunnel</p>
     </div>
+    <script>
+        (function() {{
+            var lanIp = "{lan_ip}";
+            var lanPort = {Config.LOCAL_PORT};
+            var lanUrl = "http://" + lanIp + ":" + lanPort;
+            if (lanIp && lanIp !== "None" && window.location.hostname !== lanIp) {{
+                var discoveryDiv = document.getElementById('lan-discovery');
+                var lanBtn = document.getElementById('lan-btn');
+                var img = new Image();
+                img.onload = function() {{
+                    discoveryDiv.style.display = 'block';
+                    lanBtn.href = lanUrl + window.location.pathname + window.location.search;
+                }};
+                img.src = lanUrl + "/ping?t=" + Date.now();
+            }}
+        }})();
+    </script>
+    {self.get_smart_redirect_js()}
 </body>
 </html>"""
         
@@ -598,7 +771,7 @@ class FileTransferHandler(BaseHTTPRequestHandler):
                             if n == 0: break # EOF or other issue
                             sent += n
                     except BrokenPipeError:
-                        print(f"✗ Client disconnected during transfer of '{filename}'")
+                        print(f"{ERR} Client disconnected during transfer of '{filename}'")
                 else:
                     try:
                         remaining = content_length
@@ -610,14 +783,14 @@ class FileTransferHandler(BaseHTTPRequestHandler):
                             self.wfile.write(chunk)
                             remaining -= len(chunk)
                     except BrokenPipeError:
-                        print(f"✗ Client disconnected during transfer of '{filename}'")
+                        print(f"{ERR} Client disconnected during transfer of '{filename}'")
             
             if not range_req or (range_req and end == file_size - 1):
-                print(f"✓ File '{filename}' served to {self.client_address[0]}")
+                print(f"{OK} File '{filename}' served to {self.client_address[0]}")
         except Exception as e:
             # Don't send another error if it's a broken pipe, as the connection is already gone
             if not isinstance(e, BrokenPipeError) and "Broken pipe" not in str(e):
-                print(f"✗ Error serving file '{filename}': {e}")
+                print(f"{ERR} Error serving file '{filename}': {e}")
                 if not self.wfile.closed:
                     try: self.send_error(500, "Internal Server Error")
                     except: pass
@@ -693,11 +866,11 @@ class NgrokAuth:
             
             if authtoken and len(authtoken) > 20:
                 self.save_authtoken(authtoken)
-                print("\n✓ Authtoken saved successfully!")
+                print(f"\n{OK} Authtoken saved successfully!")
                 print(f"   Config location: {self.config_file}")
                 return authtoken
             else:
-                print("\n✗ Invalid authtoken. Please try again.")
+                print(f"\n{ERR} Invalid authtoken. Please try again.")
                 return None
         else:
             print("\n[OPTIONS]:")
@@ -714,7 +887,7 @@ class NgrokAuth:
             ngrok.set_auth_token(token)
             return True
         except Exception as e:
-            print(f"✗ Token verification failed: {e}")
+            print(f"{ERR} Token verification failed: {e}")
             return False
 
 
@@ -784,18 +957,18 @@ class NgrokTunnel:
             if self.public_url.startswith('http://'):
                 self.public_url = self.public_url.replace('http://', 'https://')
             
-            print(f"✓ Tunnel established: {self.public_url}")
+            print(f"{OK} Tunnel established: {self.public_url}")
             return True
             
         except ImportError:
-            print("✗ Error: pyngrok is not installed")
+            print(f"{ERR} Error: pyngrok is not installed")
             print("   Install with: pip install pyngrok")
             return False
         except Exception as e:
             error_msg = str(e).lower()
             
             if 'authtoken' in error_msg or 'unauthorized' in error_msg or 'invalid' in error_msg:
-                print(f"✗ Authentication error: {e}")
+                print(f"{ERR} Authentication error: {e}")
                 print("\n[*] Your authtoken might be invalid or expired.")
                 
                 # Show default SSH alternative
@@ -819,16 +992,16 @@ class NgrokTunnel:
                         self.public_url = self.tunnel.public_url
                         if self.public_url.startswith('http://'):
                             self.public_url = self.public_url.replace('http://', 'https://')
-                        print(f"✓ Tunnel established: {self.public_url}")
+                        print(f"{OK} Tunnel established: {self.public_url}")
                         return True
                     except Exception as retry_error:
-                        print(f"✗ Still failed: {retry_error}")
+                        print(f"{ERR} Still failed: {retry_error}")
                         if platform.system() != 'Windows':
                             print("\n💡 Try restarting without --ngrok")
                         return False
                 return False
             else:
-                print(f"✗ Error starting ngrok: {e}")
+                print(f"{ERR} Error starting ngrok: {e}")
                 return False
     
     def stop(self):
@@ -918,7 +1091,7 @@ class SSHTunnel:
             
             # Wait for URL with timeout
             if self.url_found.wait(timeout=20):
-                print(f"✓ Connected via {self.name}: {self.public_url}")
+                print(f"{OK} Connected via {self.name}: {self.public_url}")
                 return True
             else:
                 print(f"[!] {self.name} timeout - no URL received")
@@ -945,104 +1118,82 @@ class SSHTunnel:
             print("\n[*] SSH tunnel closed")
 
 
-class LanServer:
-    """Manages high-speed LAN file sharing"""
-    
-    def __init__(self, local_port):
-        self.local_port = local_port
-        self.public_url = None
-        self.ip = None
-        self.name = "LAN"
-        
-    def start(self):
-        """Detect LAN IP and prepare the URL"""
-        print(f"\n[*] Starting LAN mode...")
-        self.ip = get_lan_ip()
-        
-        if not self.ip:
-            print("✗ Error: Could not detect LAN IP address.")
-            print("  Make sure you are connected to a Wi-Fi or local network.")
-            return False
-        
-        if self.ip.startswith("127."):
-            print("\n" + "!"*60)
-            print("⚠️  WARNING: NO LAN IP DETECTED")
-            print("!"*60)
-            print("Only loopback IP (127.0.0.1) was found.")
-            print("Other devices on your Wi-Fi will NOT be able to connect.")
-            print("Please check your network connection.")
-            print("!"*60 + "\n")
-            
-        self.public_url = f"http://{self.ip}:{self.local_port}"
-        print(f"✓ LAN server active: {self.public_url}")
-        return True
-
-    def stop(self):
-        """Stop LAN server (placeholder)"""
-        pass
-
-
 class TunnelManager:
-    """Manages tunnel services"""
+    """Manages tunnel services and LAN discovery"""
     
-    def __init__(self, local_port, noauth=False, lan=False):
+    def __init__(self, local_port, noauth=False, lan_only=False):
         self.local_port = local_port
         self.active_tunnel = None
         self.public_url = None
+        self.lan_url = None
+        self.lan_ip = None
         self.auth_manager = NgrokAuth()
         self.noauth = noauth
-        self.lan = lan
+        self.lan_only = lan_only
         
     def start(self):
-        """Start tunnel based on mode"""
-        if self.lan:
+        """Start services. In Smart Mode (default), both LAN and Tunnel are prepared."""
+        # 1. Detect LAN IP
+        self.lan_ip = get_lan_ip()
+        if self.lan_ip:
+            self.lan_url = f"http://{self.lan_ip}:{self.local_port}"
+        
+        # 2. Handle LAN-only mode
+        if self.lan_only:
             print("\n" + "="*60)
             print("LAN MODE ACTIVE")
             print("="*60)
-            lan_server = LanServer(self.local_port)
-            if lan_server.start():
-                self.active_tunnel = lan_server
-                self.public_url = lan_server.public_url
+            if self.lan_ip:
+                print(f"{OK} LAN server active: {self.lan_url}")
                 print("="*60)
                 return True
-            print("="*60)
-            return False
+            else:
+                print(f"{ERR} Error: Could not detect LAN IP address.")
+                print("  Make sure you are connected to a Wi-Fi or local network.")
+                print("="*60)
+                return False
 
+        # 3. Smart Mode or Tunnel Mode
         print("\n" + "="*60)
-        print("ESTABLISHING PUBLIC TUNNEL")
+        if self.lan_ip:
+            print("SMART MODE ENABLED (LAN + Tunnel)")
+        else:
+            print("ESTABLISHING PUBLIC TUNNEL")
         print("="*60)
         
+        # Try to establish a public tunnel as fallback/primary
+        success = False
         if self.noauth:
             # Try SSH tunnel first (localhost.run)
             ssh_tunnel = SSHTunnel(self.local_port)
             if ssh_tunnel.start():
                 self.active_tunnel = ssh_tunnel
                 self.public_url = ssh_tunnel.public_url
-                print("="*60)
-                return True
+                success = True
             else:
                 print("\n[!] No-auth SSH tunnel failed. Falling back to ngrok...")
-                print("="*60)
         
-        # Use ngrok (default or fallback)
-        ngrok_tunnel = NgrokTunnel(self.local_port, self.auth_manager)
-        if ngrok_tunnel.start():
-            self.active_tunnel = ngrok_tunnel
-            self.public_url = ngrok_tunnel.public_url
+        if not success:
+            # Use ngrok (default or fallback)
+            ngrok_tunnel = NgrokTunnel(self.local_port, self.auth_manager)
+            if ngrok_tunnel.start():
+                self.active_tunnel = ngrok_tunnel
+                self.public_url = ngrok_tunnel.public_url
+                success = True
+
+        if success:
             print("="*60)
             return True
         
+        # If tunnel failed but we have LAN IP, we can still work in LAN mode
+        if self.lan_ip:
+            print("\n[!] Tunnel services failed. Continuing in LAN-only mode.")
+            print("="*60)
+            return True
+
         print("="*60)
-        print("\n✗ All tunnel services failed")
-        print("\n[SOLUTIONS]:")
-        if platform.system() != 'Windows' and not self.noauth:
-            print("  1. 🚀 EASIEST: Restart without --ngrok to try SSH tunneling")
-            print("     Example: qrtunnel <your_files>")
-            print()
-        print("  2. Make sure you have a valid ngrok authtoken")
-        print("  3. Run: qrtunnel --setup (to configure ngrok)")
-        print("  4. Check your internet connection")
-        print("  5. Check your firewall settings")
+        print(f"\n{ERR} All connection services failed")
+        # ... rest of error message will be in main or here ...
         return False
     
     def stop(self):
@@ -1051,7 +1202,7 @@ class TunnelManager:
             self.active_tunnel.stop()
 
 
-def generate_qr_code(url):
+def generate_qr_code(primary_url, fallback_url=None):
     """Generate and display QR code in terminal"""
     try:
         import qrcode
@@ -1062,23 +1213,41 @@ def generate_qr_code(url):
             box_size=1,
             border=2,
         )
-        qr.add_data(url)
+        
+        # QR points to the most likely to work URL (LAN if available, otherwise Tunnel)
+        # However, for true reliability, the Tunnel is safer.
+        # But for "Smart Mode", we want to promote the high-speed LAN link.
+        qr_url = primary_url
+        qr.add_data(qr_url)
         qr.make(fit=True)
         
         print("\n" + "="*60)
-        print("SCAN THIS QR CODE TO ACCESS THE FILES:")
-        print("="*60)
-        qr.print_ascii(invert=True)
-        print("="*60)
-        print(f"\n🌐 URL: {url}")
+        if fallback_url:
+            print(f"  {CLR_G}{DOT} {CLR_Y}{DOT} {CLR_R}{DOT} {CLR_B}{DOT}{CLR_RST}  qrtunnel - Smart mode enabled")
+            print("="*60)
+            qr.print_ascii(invert=True)
+            print("="*60)
+            # The primary URL for the QR is the Tunnel, but we show LAN as the 'Fast' option
+            # The JS will auto-switch them if they are on LAN.
+            print(f"{INFO} Internet link: {primary_url}")
+            print(f"{OK} Fast local link: {fallback_url}")
+            print("(Auto-detects and switches to High Speed if on same Wi-Fi)")
+        else:
+            print("SCAN THIS QR CODE TO ACCESS THE FILES:")
+            print("="*60)
+            qr.print_ascii(invert=True)
+            print("="*60)
+            print(f"\n{INFO} URL: {qr_url}")
         print("="*60 + "\n")
         
     except ImportError:
         print("\n" + "="*60)
-        print("⚠️  QR code library not installed")
+        print(f"{WRN} QR code library not installed")
         print("Install with: pip install qrcode")
         print("="*60)
-        print(f"\n🌐 URL: {url}")
+        print(f"{OK} Link: {primary_url}")
+        if fallback_url:
+            print(f"{INFO} Fallback: {fallback_url}")
         print("="*60 + "\n")
 
 
@@ -1113,9 +1282,9 @@ def main():
         auth = NgrokAuth()
         token = auth.setup_ngrok_account()
         if token:
-            print("\n✓ Setup complete! You can now use qrtunnel to share or receive files.")
+            print(f"\n{OK} Setup complete! You can now use qrtunnel to share or receive files.")
         else:
-            print("\n✗ Setup incomplete. Please try again.")
+            print(f"\n{ERR} Setup incomplete. Please try again.")
         sys.exit(0 if token else 1)
     
     # Handle status check
@@ -1127,10 +1296,10 @@ def main():
         print("="*60)
         if token:
             masked_token = token[:8] + "..." + token[-4:] if len(token) > 12 else "***"
-            print(f"✓ Ngrok authtoken found: {masked_token}")
+            print(f"{OK} Ngrok authtoken found: {masked_token}")
             print(f"  Config location: {auth.config_file}")
         else:
-            print("✗ No ngrok authtoken configured")
+            print(f"{ERR} No ngrok authtoken configured")
             print("\nTo set up ngrok:")
             print("  1. Run: qrtunnel --setup")
             print("  2. Or visit: https://dashboard.ngrok.com/get-started/your-authtoken")
@@ -1146,7 +1315,7 @@ def main():
         noauth_mode = False
         if args.noauth:
             print("\n" + "="*60)
-            print("⚠️  WARNING: --noauth is not supported on Windows")
+            print(f"{WRN} WARNING: --noauth is not supported on Windows")
             print("="*60)
             print("The --noauth option uses SSH tunneling which is not reliably supported on Windows.")
             print("Proceeding with ngrok instead...")
@@ -1162,11 +1331,11 @@ def main():
     if not upload_mode:
         for file_path in args.file_paths:
             if not os.path.exists(file_path):
-                print(f"✗ Error: File '{file_path}' not found")
+                print(f"{ERR} Error: File '{file_path}' not found")
                 sys.exit(1)
             
             if not os.path.isfile(file_path):
-                print(f"✗ Error: '{file_path}' is not a file")
+                print(f"{ERR} Error: '{file_path}' is not a file")
                 sys.exit(1)
 
     # Display banner
@@ -1181,10 +1350,8 @@ def main():
 
     if args.lan:
         print("Tunnel: LAN (high-speed local network)")
-    elif noauth_mode:
-        print("Tunnel: No-auth (SSH via localhost.run)")
     else:
-        print("Tunnel: ngrok (authenticated)")
+        print("Tunnel: Smart Mode (LAN + Public Tunnel)")
     print("="*60)
     
     if not upload_mode:
@@ -1198,37 +1365,43 @@ def main():
         print(f"  - {os.getcwd()}")
         print("="*60)
 
+    # Set up tunnel manager first to get LAN IP
+    tunnel_manager = TunnelManager(Config.LOCAL_PORT, noauth=noauth_mode, lan_only=args.lan)
+    
     # Set up handler
     FileTransferHandler.file_paths = args.file_paths if not upload_mode else None
     FileTransferHandler.upload_mode = upload_mode
+    FileTransferHandler.server_lan_ip = get_lan_ip() # Pre-detect for handler
     
     # Start HTTP server
-    # We bind to 0.0.0.0 in LAN mode to be accessible from other devices
-    bind_address = '0.0.0.0' if args.lan else 'localhost'
+    # We bind to 0.0.0.0 to be accessible from LAN
+    bind_address = '0.0.0.0'
     try:
         server = ThreadingHTTPServer((bind_address, Config.LOCAL_PORT), FileTransferHandler)
     except OSError as e:
-        print(f"\n✗ Error: Could not bind to port {Config.LOCAL_PORT}")
+        print(f"\n{ERR} Error: Could not bind to port {Config.LOCAL_PORT}")
         print(f"   {e}")
         sys.exit(1)
     
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     
-    if args.lan:
-        print(f"\n✓ HTTP server started on all interfaces (port {Config.LOCAL_PORT})")
-    else:
-        print(f"\n✓ HTTP server started on localhost:{Config.LOCAL_PORT}")
+    print(f"\n{OK} HTTP server started on all interfaces (port {Config.LOCAL_PORT})")
     
-    # Start tunnel
-    tunnel_manager = TunnelManager(Config.LOCAL_PORT, noauth=noauth_mode, lan=args.lan)
-    
+    # Start tunnel(s)
     if not tunnel_manager.start():
         server.shutdown()
         sys.exit(1)
     
-    # Generate and display QR code
-    generate_qr_code(tunnel_manager.public_url)
+    # Generate and display QR code(s)
+    if tunnel_manager.lan_url and tunnel_manager.public_url:
+        # Smart Mode: Public URL is the "gateway" QR because it works everywhere.
+        # The JS on the page will handle promoting to LAN if available.
+        generate_qr_code(tunnel_manager.public_url, tunnel_manager.lan_url)
+    elif tunnel_manager.public_url:
+        generate_qr_code(tunnel_manager.public_url)
+    else:
+        generate_qr_code(tunnel_manager.lan_url)
     
     print("[*] Server is running. Press 'q' to quit, or Ctrl+C to stop.\n")
     
