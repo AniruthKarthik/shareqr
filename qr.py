@@ -1506,7 +1506,7 @@ def format_size(bytes):
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="qrtunnel: Simple cross-platform file sharing and receiving via QR code. Defaults to account-free SSH tunneling on Linux/macOS.",
+        description="qrtunnel: Secure cross-platform file sharing and receiving. Features smart LAN detection with auto high-speed fallback, 6-digit OTP security, and randomized port selection.",
         usage="""qrtunnel [file_path1] [file_path2] ... [options]
        qrtunnel (starts in upload mode)"""
     )
@@ -1516,7 +1516,7 @@ def main():
     parser.add_argument('--status', action='store_true', help='Check authentication status')
     parser.add_argument('--ngrok', action='store_true', help='Use ngrok for tunneling (Default on Windows)')
     parser.add_argument('--noauth', action='store_true', help='Use SSH tunnel (localhost.run) (Default on Linux/macOS)')
-    parser.add_argument('--lan', action='store_true', help='Use local network (Wi-Fi) sharing instead of tunneling')
+    parser.add_argument('--lan', action='store_true', help='Use local network (Wi-Fi) sharing instead of tunneling. Secured by 6-digit OTP.')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     
     args = parser.parse_args()

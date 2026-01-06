@@ -7,6 +7,9 @@ Cross-platform file sharing via SSH reverse tunneling and QR codes. Allows shari
 *   **Simple File Sharing:** Share one or more files directly from your command line.
 *   **Receive Files:** Start in upload mode to receive files from any device with a web browser, like your phone.
 *   **High-Speed LAN Sharing:** Use the `--lan` flag to share files directly over your local Wi-Fi/network at maximum speed, bypassing the internet.
+*   **Smart Auto-Detection:** Automatically detects if the recipient is on the same Wi-Fi and switches to high-speed LAN transfer instantly, bypassing the tunnel.
+*   **LAN Security (OTP):** High-speed LAN transfers are protected by a random 6-digit passcode displayed only on your terminal.
+*   **Randomized Port:** Every run uses a different random port (20000-60000) for security and to prevent port conflicts.
 *   **Secure Tunnels:** Supports both **SSH Tunneling** (default on Linux/macOS) and **ngrok** (default on Windows) for secure, public access even behind NATs/firewalls.
 *   **SSH Tunneling:** Default on Linux/macOS! Uses `localhost.run` for instant tunneling without any account or sign-up.
 *   **Ngrok Support:** Reliable tunneling via ngrok (requires free account), available on all platforms and default on Windows.
